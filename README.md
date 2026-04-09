@@ -35,6 +35,25 @@ POST /api/query  → { query_id, status: "processing" | "rejected" }
 GET  /api/query/{id} → polling → "processing" | "processed" | "rejected"
 ```
 
+## Dependencias
+
+### Sistema
+| Dependencia | Versión | Notas |
+|-------------|---------|-------|
+| Python | 3.10+ | Backend, embedder y scripts de carga |
+| CUDA Toolkit | 12.x | GPU NVIDIA para BGE-M3 (fp16) y llama.cpp |
+| NGINX | 1.18+ | Proxy reversa y archivos estáticos |
+| Qdrant | 1.10+ | Servidor vectorial (binario nativo o Docker) |
+| llama.cpp | reciente | `llama-server` compilado con CUDA, en `../llama.cpp/build/bin/` |
+| ngrok (opcional) | — | Túnel público vía `tunnel.py` |
+
+### Adicional para cargar datos a Qdrant
+El script [scripts/load_parquet_qdrant.py](scripts/load_parquet_qdrant.py) requiere además:
+
+```bash
+pip install pandas pyarrow tqdm
+```
+
 ## Instalación
 
 ```bash
@@ -44,6 +63,37 @@ pip install -r requirements.txt
 ```
 
 El modelo GGUF se descarga automáticamente al iniciar `start_llama.sh` si no existe en `../models/`.
+
+## Cargar datos en Qdrant
+
+El pipeline RAG espera la colección `rag_documents` en Qdrant con vectores **dense** (BGE-M3, 1024-d) y **sparse** (léxicos). Los chunks ya embebidos están publicados en Hugging Face:
+
+**https://huggingface.co/datasets/ferMorales/Gaceta_UNAM_BGE_M3_V2**
+
+### 1. Iniciar el servidor Qdrant
+
+Descarga el binario nativo desde [github.com/qdrant/qdrant/releases](https://github.com/qdrant/qdrant/releases) y arráncalo. Por defecto escucha en `http://localhost:6333` (HTTP) y `:6334` (gRPC).
+
+```bash
+./qdrant
+```
+
+### 2. Descargar el parquet y cargarlo a Qdrant
+
+El script [scripts/load_parquet_qdrant.py](scripts/load_parquet_qdrant.py) descarga el parquet desde Hugging Face y hace upsert directo a Qdrant.
+
+```bash
+source ../venv/bin/activate
+python scripts/load_parquet_qdrant.py
+```
+
+Por defecto descarga `embeddings_bgem3.parquet` del repo HF, se conecta a Qdrant vía **gRPC** en `localhost:6334` (requerido para upsert eficiente), crea la colección `rag_documents` y sube los ~208k puntos.
+
+### 3. Verificar la carga
+
+```bash
+curl http://localhost:6333/collections/rag_documents | jq '.result.points_count'
+```
 
 ## Uso
 
@@ -90,6 +140,8 @@ app/
 │   └── app.js
 ├── nginx/
 │   └── nginx.conf
+├── scripts/
+│   └── load_parquet_qdrant.py  # Descarga el parquet de HF y lo carga a Qdrant
 ├── start_llama.sh
 └── tunnel.py
 ```
