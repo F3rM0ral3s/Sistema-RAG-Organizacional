@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gaceta UNAM — RAG</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Gaceta UNAM</h1>
+            <p class="subtitle">Sistema de consulta con Retrieval-Augmented Generation</p>
+        </header>
+
+        <main>
+            <form id="query-form">
+                <div class="input-group">
+                    <textarea
+                        id="query-input"
+                        placeholder="Escribe tu pregunta sobre la Gaceta UNAM..."
+                        rows="3"
+                        maxlength="2000"
+                    ></textarea>
+                    <button type="submit" id="submit-btn">
+                        <span class="btn-text">Consultar</span>
+                        <span class="btn-loading hidden">Procesando...</span>
+                    </button>
+                </div>
+            </form>
+
+            <div id="status-bar" class="hidden">
+                <div class="status-indicator">
+                    <div class="spinner"></div>
+                    <span id="status-text">Procesando consulta...</span>
+                </div>
+            </div>
+
+            <div id="result-container" class="hidden">
+                <section id="answer-section">
+                    <h2>Respuesta</h2>
+                    <div id="answer-content"></div>
+                </section>
+
+                <section id="sources-section">
+                    <h2>Fuentes</h2>
+                    <div id="sources-list"></div>
+                </section>
+
+                <section id="expanded-section" class="hidden">
+                    <h2>Consultas expandidas</h2>
+                    <ul id="expanded-list"></ul>
+                </section>
+            </div>
+
+            <div id="error-container" class="hidden">
+                <p id="error-message"></p>
+            </div>
+        </main>
+
+        <footer>
+            <p>Sistema RAG Organizacional — Modelo Qwen3.5 + Qdrant + RRF</p>
+        </footer>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
