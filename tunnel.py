@@ -10,6 +10,7 @@ Or set the environment variable:
     python3 tunnel.py
 """
 
+import os
 import sys
 import time
 
@@ -17,12 +18,7 @@ from pyngrok import conf, ngrok
 
 
 def main():
-    token = None
-    if len(sys.argv) > 1:
-        token = sys.argv[1]
-    else:
-        import os
-        token = os.environ.get("NGROK_AUTHTOKEN")
+    token = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("NGROK_AUTHTOKEN")
 
     if not token:
         print("Usage: python3 tunnel.py <NGROK_AUTHTOKEN>")

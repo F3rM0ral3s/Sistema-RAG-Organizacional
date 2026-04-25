@@ -1,15 +1,22 @@
 /**
  * Gaceta UNAM RAG Frontend
  *
- * Event-based polling: submit → poll every 1s → display result.
+ * Event-based polling: submit → poll until terminal status → display result.
  * Rate limiting is handled server-side; the frontend simply disables
  * the submit button while a query is in-flight.
  */
 
 const API_BASE = "/api";
 const POLL_INTERVAL_MS = 1000;
+const POLL_MAX_ATTEMPTS = 600; // ~10 min at 1 Hz
 
-// Generate a persistent user_id per browser session
+const STATUS = Object.freeze({
+    PROCESSING: "processing",
+    PROCESSED: "processed",
+    REJECTED: "rejected",
+    FAILED: "failed",
+});
+
 const USER_ID = sessionStorage.getItem("user_id") || (() => {
     const id = crypto.randomUUID();
     sessionStorage.setItem("user_id", id);
@@ -32,19 +39,14 @@ const errorContainer = document.getElementById("error-container");
 const errorMessage = document.getElementById("error-message");
 
 let pollTimer = null;
+let pollController = null;
 
-/** Convert LLM text output to readable HTML */
 function renderAnswer(text) {
-    // Escape HTML
     let html = text
         .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-
-    // Bold: **text**
     html = html.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
-    // Italic: *text*
     html = html.replace(/(?<!\w)\*(.+?)\*(?!\w)/g, "<em>$1</em>");
 
-    // Split into lines for block-level processing
     const lines = html.split("\n");
     const result = [];
     let inList = false;
@@ -57,19 +59,13 @@ function renderAnswer(text) {
         } else {
             if (inList) { result.push("</ul>"); inList = false; }
             const trimmed = line.trim();
-            if (trimmed === "") {
-                result.push("<br>");
-            } else {
-                result.push(`<p>${trimmed}</p>`);
-            }
+            result.push(trimmed === "" ? "<br>" : `<p>${trimmed}</p>`);
         }
     }
     if (inList) result.push("</ul>");
-
     return result.join("");
 }
 
-/** Extract issue number from source_pdf path */
 function extractIssueRef(src) {
     if (src.source_pdf) {
         const m = src.source_pdf.match(/issue_(\d+)/);
@@ -100,32 +96,40 @@ function showError(msg) {
     setLoading(false);
 }
 
+function appendMetaSpan(parent, text) {
+    const span = document.createElement("span");
+    span.textContent = text;
+    parent.appendChild(span);
+}
+
 function showResult(data) {
     hideAll();
     setLoading(false);
 
-    if (data.status === "rejected") {
+    if (data.status === STATUS.REJECTED) {
         showError(data.rejection_reason || "Consulta rechazada.");
         return;
     }
+    if (data.status === STATUS.FAILED) {
+        showError(data.answer || "Error al procesar la consulta.");
+        return;
+    }
 
-    // Answer
     answerContent.innerHTML = renderAnswer(data.answer || "Sin respuesta.");
 
-    // Sources
     sourcesList.innerHTML = "";
     if (data.sources && data.sources.length > 0) {
-        data.sources.forEach((src, i) => {
+        data.sources.forEach((src) => {
             const card = document.createElement("div");
             card.className = "source-card";
 
             const meta = document.createElement("div");
             meta.className = "source-meta";
             const issueRef = extractIssueRef(src);
-            if (issueRef) meta.innerHTML += `<span>${issueRef}</span>`;
-            if (src.issue_date) meta.innerHTML += `<span>${src.issue_date}</span>`;
-            if (src.chunk_index) meta.innerHTML += `<span>Fragmento ${src.chunk_index}</span>`;
-            meta.innerHTML += `<span>Relevancia: ${(src.score * 100).toFixed(1)}%</span>`;
+            if (issueRef) appendMetaSpan(meta, issueRef);
+            if (src.issue_date) appendMetaSpan(meta, src.issue_date);
+            if (src.chunk_index) appendMetaSpan(meta, `Fragmento ${src.chunk_index}`);
+            appendMetaSpan(meta, `Relevancia: ${(src.score * 100).toFixed(1)}%`);
 
             const text = document.createElement("div");
             text.className = "source-text";
@@ -137,7 +141,6 @@ function showResult(data) {
         });
     }
 
-    // Expanded queries
     expandedList.innerHTML = "";
     if (data.expanded_queries && data.expanded_queries.length > 0) {
         expandedSection.classList.remove("hidden");
@@ -153,24 +156,33 @@ function showResult(data) {
     resultContainer.classList.remove("hidden");
 }
 
-async function pollResult(queryId) {
+function cancelPoll() {
+    if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+    if (pollController) { pollController.abort(); pollController = null; }
+}
+
+async function pollResult(queryId, attempt = 0) {
+    if (attempt >= POLL_MAX_ATTEMPTS) {
+        showError("La consulta tardó demasiado. Intenta nuevamente.");
+        return;
+    }
+    pollController = new AbortController();
     try {
-        const resp = await fetch(`${API_BASE}/query/${queryId}`);
+        const resp = await fetch(`${API_BASE}/query/${queryId}`, {
+            signal: pollController.signal,
+        });
         if (!resp.ok) {
             showError(`Error al consultar estado: ${resp.status}`);
             return;
         }
         const data = await resp.json();
-
-        if (data.status === "processing") {
-            // Keep polling
-            pollTimer = setTimeout(() => pollResult(queryId), POLL_INTERVAL_MS);
+        if (data.status === STATUS.PROCESSING) {
+            pollTimer = setTimeout(() => pollResult(queryId, attempt + 1), POLL_INTERVAL_MS);
             return;
         }
-
-        // processed or rejected
         showResult(data);
     } catch (err) {
+        if (err.name === "AbortError") return;
         showError(`Error de conexión: ${err.message}`);
     }
 }
@@ -182,7 +194,7 @@ form.addEventListener("submit", async (e) => {
 
     hideAll();
     setLoading(true);
-    if (pollTimer) clearTimeout(pollTimer);
+    cancelPoll();
 
     try {
         const resp = await fetch(`${API_BASE}/query`, {
@@ -195,7 +207,6 @@ form.addEventListener("submit", async (e) => {
             showError("Ya tienes una consulta en proceso. Espera a que termine.");
             return;
         }
-
         if (!resp.ok) {
             const err = await resp.json().catch(() => ({}));
             showError(err.detail || `Error: ${resp.status}`);
@@ -203,15 +214,6 @@ form.addEventListener("submit", async (e) => {
         }
 
         const data = await resp.json();
-
-        if (data.status === "rejected") {
-            showResult(data);
-            // Need to fetch full result for rejection_reason
-            const full = await fetch(`${API_BASE}/query/${data.query_id}`);
-            if (full.ok) showResult(await full.json());
-            return;
-        }
-
         statusText.textContent = "Procesando consulta...";
         pollTimer = setTimeout(() => pollResult(data.query_id), POLL_INTERVAL_MS);
     } catch (err) {
@@ -219,7 +221,6 @@ form.addEventListener("submit", async (e) => {
     }
 });
 
-// Allow Ctrl+Enter to submit
 input.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
         form.dispatchEvent(new Event("submit"));

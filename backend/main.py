@@ -2,14 +2,15 @@
 FastAPI backend for the organizational RAG system.
 
 Architecture:
-- Event-based: submit query → poll for result (processing / processed / rejected)
+- Event-based: submit query → poll for result (processing / processed / rejected / failed)
 - Rate limiter: one query per user at a time
 - Query expansion + RRF fusion
-- Jailbreak detection
+- Jailbreak detection (runs inside the pipeline so submit returns immediately)
 """
 
 import asyncio
 import logging
+import time
 import uuid
 from contextlib import asynccontextmanager
 
@@ -21,12 +22,12 @@ from .models import (
     QueryResultResponse,
     QueryStatus,
     QuerySubmitResponse,
-    SourceChunk,
 )
 from .rag.embedder import embedder
 from .rag.expander import expand_query
 from .rag.generator import generate_answer
 from .rag.guard import detect_jailbreak
+from .rag.llm_client import close_client
 from .rag.retriever import retriever
 
 logging.basicConfig(
@@ -35,24 +36,38 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ── In-memory stores ─────────────────────────────────────────────────────────
-# query_id → QueryResultResponse
-query_results: dict[str, QueryResultResponse] = {}
-# user_id → query_id (tracks the active query per user for rate limiting)
+# Retain query results for one hour, then evict on next write.
+RESULT_TTL_SECONDS = 3600
+
+# query_id → (created_at_monotonic, response)
+query_results: dict[str, tuple[float, QueryResultResponse]] = {}
+# user_id → query_id (active query per user, for rate limiting)
 active_user_queries: dict[str, str] = {}
-# Lock for active_user_queries
 user_lock = asyncio.Lock()
+
+
+def _save_result(query_id: str, response: QueryResultResponse) -> None:
+    now = time.monotonic()
+    query_results[query_id] = (now, response)
+    cutoff = now - RESULT_TTL_SECONDS
+    for qid in [k for k, (ts, _) in query_results.items() if ts < cutoff]:
+        del query_results[qid]
+
+
+def _get_result(query_id: str) -> QueryResultResponse | None:
+    item = query_results.get(query_id)
+    return item[1] if item else None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Load models and connect to Qdrant on startup."""
     logger.info("Starting up — loading models...")
     embedder.load()
     retriever.load()
     logger.info("Startup complete.")
     yield
     logger.info("Shutting down.")
+    await close_client()
 
 
 app = FastAPI(
@@ -70,73 +85,55 @@ app.add_middleware(
 )
 
 
-# ── RAG pipeline (runs in background task) ────────────────────────────────────
-
 async def run_rag_pipeline(query_id: str, query: str, user_id: str):
-    """Full RAG pipeline: expand → embed → retrieve (RRF) → generate."""
+    """Full pipeline: guard → expand → embed → retrieve (RRF) → generate."""
     try:
-        # 1. Query expansion (generate 3 rephrased queries via LLM)
+        rejection = await detect_jailbreak(query)
+        if rejection:
+            _save_result(query_id, QueryResultResponse(
+                query_id=query_id,
+                status=QueryStatus.REJECTED,
+                rejection_reason=rejection,
+            ))
+            return
+
         expanded_queries = await expand_query(query)
         logger.info("Expanded %d queries from original", len(expanded_queries))
 
-        # 2. Embed all queries (original + expanded) — dense + sparse
         all_queries = [query] + expanded_queries
         all_embeddings = await asyncio.to_thread(embedder.embed_queries, all_queries)
 
-        # 3. Hybrid retrieval: dense + sparse search with RRF fusion
         chunks = await asyncio.to_thread(
             retriever.search_multi_rrf, all_embeddings, original_query=query
         )
         logger.info("Retrieved %d chunks via RRF", len(chunks))
 
-        # 5. Generate answer using LLM + retrieved context
         answer = await generate_answer(query, chunks)
 
-        # 6. Store result
-        query_results[query_id] = QueryResultResponse(
+        _save_result(query_id, QueryResultResponse(
             query_id=query_id,
             status=QueryStatus.PROCESSED,
             answer=answer,
             sources=chunks,
             expanded_queries=expanded_queries,
-        )
+        ))
 
     except Exception as e:
         logger.error("RAG pipeline failed for query_id=%s: %s", query_id, e, exc_info=True)
-        query_results[query_id] = QueryResultResponse(
+        _save_result(query_id, QueryResultResponse(
             query_id=query_id,
-            status=QueryStatus.PROCESSED,
+            status=QueryStatus.FAILED,
             answer=f"Error al procesar la consulta: {e}",
-            sources=[],
-            expanded_queries=[],
-        )
+        ))
     finally:
-        # Release user rate limit
         async with user_lock:
             if active_user_queries.get(user_id) == query_id:
                 del active_user_queries[user_id]
 
 
-# ── Endpoints ─────────────────────────────────────────────────────────────────
-
 @app.post("/api/query", response_model=QuerySubmitResponse)
 async def submit_query(req: QueryRequest):
-    """
-    Submit a query for processing.
-    Rate limited: one query per user at a time.
-    """
-    # Jailbreak check (LLM-as-judge)
-    rejection = await detect_jailbreak(req.query)
-    if rejection:
-        query_id = str(uuid.uuid4())
-        query_results[query_id] = QueryResultResponse(
-            query_id=query_id,
-            status=QueryStatus.REJECTED,
-            rejection_reason=rejection,
-        )
-        return QuerySubmitResponse(query_id=query_id, status=QueryStatus.REJECTED)
-
-    # Rate limit: one query per user
+    """Submit a query for processing. Rate limited: one query per user at a time."""
     async with user_lock:
         if req.user_id in active_user_queries:
             raise HTTPException(
@@ -146,29 +143,25 @@ async def submit_query(req: QueryRequest):
         query_id = str(uuid.uuid4())
         active_user_queries[req.user_id] = query_id
 
-    # Initialize as processing
-    query_results[query_id] = QueryResultResponse(
+    _save_result(query_id, QueryResultResponse(
         query_id=query_id,
         status=QueryStatus.PROCESSING,
-    )
-
-    # Launch pipeline in background
+    ))
     asyncio.create_task(run_rag_pipeline(query_id, req.query, req.user_id))
-
     return QuerySubmitResponse(query_id=query_id, status=QueryStatus.PROCESSING)
 
 
 @app.get("/api/query/{query_id}", response_model=QueryResultResponse)
 async def get_query_result(query_id: str):
     """Poll for query result. Returns current status."""
-    if query_id not in query_results:
+    result = _get_result(query_id)
+    if result is None:
         raise HTTPException(status_code=404, detail="Consulta no encontrada.")
-    return query_results[query_id]
+    return result
 
 
 @app.get("/api/health")
 async def health():
-    """Health check endpoint."""
     return {
         "status": "ok",
         "embedder": embedder.model is not None,

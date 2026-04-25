@@ -12,6 +12,7 @@ class QueryStatus(str, Enum):
     PROCESSING = "processing"
     PROCESSED = "processed"
     REJECTED = "rejected"
+    FAILED = "failed"
 
 
 class QueryRequest(BaseModel):
@@ -34,6 +35,20 @@ class SourceChunk(BaseModel):
     source_pdf: str = ""
     chunk_index: int = 0
     score: float = 0.0
+
+    @classmethod
+    def from_payload(cls, payload: dict, score: float) -> "SourceChunk":
+        return cls(
+            text=payload.get("text", ""),
+            doc_id=payload.get("doc_id", ""),
+            chunk_id=payload.get("chunk_id", ""),
+            corpus=payload.get("corpus", ""),
+            decade=payload.get("decade", ""),
+            issue_date=payload.get("issue_date", ""),
+            source_pdf=payload.get("source_pdf", ""),
+            chunk_index=payload.get("chunk_index", 0),
+            score=score,
+        )
 
 
 class QueryResultResponse(BaseModel):

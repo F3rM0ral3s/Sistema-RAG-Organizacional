@@ -28,6 +28,14 @@ from qdrant_client.models import (
 )
 from tqdm import tqdm
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from backend.config import (  # noqa: E402
+    DENSE_VECTOR_NAME,
+    EMBEDDING_DIM,
+    QDRANT_COLLECTION,
+    SPARSE_VECTOR_NAME,
+)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -38,8 +46,6 @@ logger = logging.getLogger(__name__)
 
 HF_REPO_ID = "ferMorales/Gaceta_UNAM_BGE_M3_V2"
 HF_FILENAME = "embeddings_bgem3.parquet"
-EMBEDDING_DIM = 1024
-COLLECTION_NAME = "rag_documents"
 QDRANT_HOST = "localhost"
 QDRANT_GRPC_PORT = 6334
 
@@ -57,20 +63,19 @@ def download_parquet(local_path: Path | None) -> Path:
 
 
 def ensure_collection(client: QdrantClient, name: str, recreate: bool) -> None:
-    exists = client.collection_exists(name)
-    if exists and recreate:
+    if client.collection_exists(name):
+        if not recreate:
+            return
         logger.info("Recreating collection '%s'.", name)
         client.delete_collection(name)
-        exists = False
-    if not exists:
-        client.create_collection(
-            collection_name=name,
-            vectors_config={
-                "dense": VectorParams(size=EMBEDDING_DIM, distance=Distance.COSINE),
-            },
-            sparse_vectors_config={"sparse": SparseVectorParams()},
-        )
-        logger.info("Created collection '%s'.", name)
+    client.create_collection(
+        collection_name=name,
+        vectors_config={
+            DENSE_VECTOR_NAME: VectorParams(size=EMBEDDING_DIM, distance=Distance.COSINE),
+        },
+        sparse_vectors_config={SPARSE_VECTOR_NAME: SparseVectorParams()},
+    )
+    logger.info("Created collection '%s'.", name)
 
 
 def build_point_id(chunk_id: str, source_file: str, chunk_index: int) -> str:
@@ -78,27 +83,28 @@ def build_point_id(chunk_id: str, source_file: str, chunk_index: int) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_URL, key))
 
 
-def row_to_point(row: pd.Series) -> PointStruct:
+def row_to_point(row: dict) -> PointStruct:
+    chunk_id = str(row["chunk_id"])
+    source_file = str(row["source_file"])
+    chunk_index = int(row["chunk_index"])
     return PointStruct(
-        id=build_point_id(
-            str(row["chunk_id"]), str(row["source_file"]), int(row["chunk_index"])
-        ),
+        id=build_point_id(chunk_id, source_file, chunk_index),
         vector={
-            "dense": [float(x) for x in row["embedding"]],
-            "sparse": SparseVector(
-                indices=[int(i) for i in row["sparse_indices"]],
-                values=[float(v) for v in row["sparse_values"]],
+            DENSE_VECTOR_NAME: row["embedding"].tolist(),
+            SPARSE_VECTOR_NAME: SparseVector(
+                indices=row["sparse_indices"].tolist(),
+                values=row["sparse_values"].tolist(),
             ),
         },
         payload={
             "doc_id": row["doc_id"],
-            "chunk_id": row["chunk_id"],
-            "chunk_index": int(row["chunk_index"]),
+            "chunk_id": chunk_id,
+            "chunk_index": chunk_index,
             "corpus": row["corpus"],
             "decade": row["decade"],
             "issue_date": row["issue_date"],
             "source_pdf": row["source_pdf"],
-            "source_file": row["source_file"],
+            "source_file": source_file,
             "text": row["text"],
         },
     )
@@ -116,7 +122,7 @@ def main() -> None:
     )
     parser.add_argument("--qdrant-host", type=str, default=QDRANT_HOST)
     parser.add_argument("--qdrant-grpc-port", type=int, default=QDRANT_GRPC_PORT)
-    parser.add_argument("--collection-name", type=str, default=COLLECTION_NAME)
+    parser.add_argument("--collection-name", type=str, default=QDRANT_COLLECTION)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--recreate-collection", action="store_true")
     args = parser.parse_args()
@@ -141,7 +147,8 @@ def main() -> None:
     total = len(df)
     for start in tqdm(range(0, total, args.batch_size), desc="Upsert", unit="batch"):
         end = min(start + args.batch_size, total)
-        batch = [row_to_point(df.iloc[i]) for i in range(start, end)]
+        rows = df.iloc[start:end].to_dict(orient="records")
+        batch = [row_to_point(r) for r in rows]
         client.upsert(collection_name=args.collection_name, points=batch, wait=True)
 
     info = client.get_collection(args.collection_name)

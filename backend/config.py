@@ -32,8 +32,3 @@ TOP_K_PER_QUERY = 50         # results per individual vector search (cast wider 
 RRF_K = 60                   # RRF constant (standard value)
 RRF_TOP_K = 30               # final chunks returned after RRF fusion
 GENERATOR_TOP_K = 30         # max chunks sent to the LLM
-# ── Rate limiter ──────────────────────────────────────────────────────────────
-# One query per user at a time (enforced by user_id)
-
-# ── Jailbreak detection ──────────────────────────────────────────────────────
-# Uses LLM-as-judge via the same llama-server (no extra config needed)

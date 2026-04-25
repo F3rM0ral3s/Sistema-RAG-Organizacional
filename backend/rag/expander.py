@@ -2,17 +2,9 @@
 
 import json
 import logging
-import re
 
-import httpx
-
-from ..config import (
-    EXPANSION_COUNT,
-    EXPANSION_MAX_TOKENS,
-    LLAMA_CHAT_ENDPOINT,
-    LLAMA_LIGHT_URL,
-    LLM_TEMPERATURE,
-)
+from ..config import EXPANSION_COUNT, EXPANSION_MAX_TOKENS, LLAMA_LIGHT_URL
+from .llm_client import chat_completion
 
 logger = logging.getLogger(__name__)
 
@@ -37,42 +29,25 @@ EXPANSION_USER_TEMPLATE = (
 )
 
 
+def _strip_markdown_fence(content: str) -> str:
+    if not content.startswith("```"):
+        return content
+    return "\n".join(l for l in content.split("\n") if not l.startswith("```"))
+
+
 async def expand_query(query: str, n: int = EXPANSION_COUNT) -> list[str]:
-    """
-    Call the LLM to generate n rephrased versions of the query.
-    Returns a list of expanded queries (may be shorter than n on failure).
-    """
-    url = f"{LLAMA_LIGHT_URL}{LLAMA_CHAT_ENDPOINT}"
-    payload = {
-        "messages": [
-            {"role": "system", "content": EXPANSION_SYSTEM_PROMPT},
-            {"role": "user", "content": EXPANSION_USER_TEMPLATE.format(n=n, query=query)},
-        ],
-        "temperature": LLM_TEMPERATURE,
-        "max_tokens": EXPANSION_MAX_TOKENS,
-        "stream": False,
-    }
-
+    """Call the LLM to generate n rephrased versions. Empty list on failure."""
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.post(url, json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-            content = data["choices"][0]["message"]["content"] or ""
-            content = re.sub(r"</?think>\s*", "", content).strip()
-
-            # Parse JSON array from response
-            # Handle cases where the model wraps in markdown code blocks
-            if content.startswith("```"):
-                lines = content.split("\n")
-                content = "\n".join(
-                    l for l in lines if not l.startswith("```")
-                )
-
-            expanded = json.loads(content)
-            if isinstance(expanded, list):
-                return [str(q).strip() for q in expanded if str(q).strip()][:n]
+        content = await chat_completion(
+            base_url=LLAMA_LIGHT_URL,
+            system=EXPANSION_SYSTEM_PROMPT,
+            user=EXPANSION_USER_TEMPLATE.format(n=n, query=query),
+            max_tokens=EXPANSION_MAX_TOKENS,
+            timeout=60.0,
+        )
+        expanded = json.loads(_strip_markdown_fence(content))
+        if isinstance(expanded, list):
+            return [str(q).strip() for q in expanded if str(q).strip()][:n]
     except Exception as e:
         logger.warning("Query expansion failed: %s", e)
-
     return []

@@ -5,18 +5,12 @@ import re
 
 import httpx
 
-from ..config import (
-    GENERATOR_TOP_K,
-    LLAMA_CHAT_ENDPOINT,
-    LLAMA_GENERATOR_URL,
-    LLM_MAX_TOKENS,
-    LLM_TEMPERATURE,
-)
+from ..config import GENERATOR_TOP_K, LLAMA_GENERATOR_URL, LLM_MAX_TOKENS
 from ..models import SourceChunk
+from .llm_client import chat_completion
 
 logger = logging.getLogger(__name__)
 
-# Context budget: reserve tokens for system prompt + response.
 # Generator has 98304 context. At ~3.5 chars/token for Spanish:
 #   98304 - 500 (system) - 2048 (response) = ~95756 tokens ≈ 335K chars
 # Cap at ~120K chars (~34K tokens) to leave headroom for response.
@@ -68,7 +62,6 @@ def _format_chunks(chunks: list[SourceChunk]) -> str:
         header = " | ".join(meta)
         part = f"{header}\n{c.text}" if header else c.text
 
-        # Enforce context budget
         if total_chars + len(part) > MAX_CONTEXT_CHARS:
             remaining = MAX_CONTEXT_CHARS - total_chars
             if remaining > 500:
@@ -84,38 +77,18 @@ def _format_chunks(chunks: list[SourceChunk]) -> str:
     return "\n\n---\n\n".join(parts)
 
 
-def _clean_think_tags(text: str) -> str:
-    """Remove residual thinking tags from model output."""
-    return re.sub(r"</?think>\s*", "", text).strip()
-
-
 async def generate_answer(query: str, chunks: list[SourceChunk]) -> str:
     """Generate a RAG answer using the LLM with retrieved context."""
-    url = f"{LLAMA_GENERATOR_URL}{LLAMA_CHAT_ENDPOINT}"
-    chunks = chunks[:GENERATOR_TOP_K]
-    context = _format_chunks(chunks)
+    context = _format_chunks(chunks[:GENERATOR_TOP_K])
     user_content = CONTEXT_TEMPLATE.format(chunks=context, query=query)
-
-    payload = {
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
-        ],
-        "temperature": LLM_TEMPERATURE,
-        "max_tokens": LLM_MAX_TOKENS,
-        "stream": False,
-    }
-
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        resp = await client.post(url, json=payload)
-        if resp.status_code != 200:
-            body = resp.text[:300]
-            logger.error("LLM returned %s: %s", resp.status_code, body)
-            raise RuntimeError(f"LLM error {resp.status_code}")
-        data = resp.json()
-        try:
-            content = data["choices"][0]["message"]["content"] or ""
-        except (KeyError, IndexError, TypeError):
-            logger.error("Malformed LLM response: %s", str(data)[:300])
-            raise RuntimeError("Respuesta inesperada del modelo de lenguaje")
-        return _clean_think_tags(content)
+    try:
+        return await chat_completion(
+            base_url=LLAMA_GENERATOR_URL,
+            system=SYSTEM_PROMPT,
+            user=user_content,
+            max_tokens=LLM_MAX_TOKENS,
+            timeout=120.0,
+        )
+    except httpx.HTTPStatusError as e:
+        logger.error("LLM returned %s: %s", e.response.status_code, e.response.text[:300])
+        raise RuntimeError(f"LLM error {e.response.status_code}") from e
